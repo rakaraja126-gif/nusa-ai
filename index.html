@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="id">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b0d12">
+  <meta name="description" content="Nusa AI — asisten AI untuk belajar, menulis, dan coding.">
+  <title>Nusa AI — Asisten AI</title>
+  <link rel="stylesheet" href="/style.css">
+  <script defer src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/dompurify@3.2.4/dist/purify.min.js"></script>
+  <script defer src="/app.js"></script>
+</head>
+<body>
+  <div id="auth-screen" class="auth-screen">
+    <div class="auth-card">
+      <div class="brand auth-brand"><span class="brand-icon">✦</span><span>Nusa AI</span></div>
+      <p class="eyebrow">ASISTEN AI PRIBADIMU</p>
+      <h1 id="auth-title">Selamat datang</h1>
+      <p class="muted" id="auth-subtitle">Masuk untuk melanjutkan percakapanmu.</p>
+      <form id="auth-form" class="auth-form">
+        <label id="name-field" class="field hidden">Nama<input id="auth-name" autocomplete="name" minlength="2" maxlength="60" placeholder="Nama kamu"></label>
+        <label class="field">Email<input id="auth-email" type="email" autocomplete="email" required maxlength="254" placeholder="nama@email.com"></label>
+        <label class="field">Kata sandi<input id="auth-password" type="password" autocomplete="current-password" required minlength="10" maxlength="128" placeholder="Minimal 10 karakter"></label>
+        <label id="admin-token-field" class="field hidden">Token bootstrap admin <input id="auth-admin-token" type="password" autocomplete="off" placeholder="Opsional, hanya admin awal"></label>
+        <p id="auth-error" class="error hidden"></p>
+        <button id="auth-submit" class="primary-btn" type="submit">Masuk</button>
+      </form>
+      <p class="auth-switch"><span id="auth-switch-copy">Belum punya akun?</span> <button id="auth-switch" class="text-btn" type="button">Daftar</button></p>
+      <p class="auth-foot">Dengan melanjutkan, gunakan layanan ini secara bertanggung jawab.</p>
+    </div>
+  </div>
+
+  <div id="app" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-icon">✦</span><span>Nusa AI</span></div>
+      <button id="new-chat" class="new-chat">＋ <span>Chat baru</span></button>
+      <div class="side-label">RIWAYAT CHAT</div>
+      <div id="chat-list" class="chat-list"></div>
+      <div class="sidebar-bottom">
+        <div class="user-avatar">N</div>
+        <div class="user-meta"><b id="user-name">Pengguna</b><small id="user-role">Akun</small></div>
+        <button id="admin-open" class="icon-btn hidden" title="Dashboard admin" aria-label="Dashboard admin">⚙</button>
+        <button id="logout" class="icon-btn" title="Keluar" aria-label="Keluar">↪</button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <button id="mobile-sidebar" class="mobile-new" aria-label="Tampilkan riwayat">☰</button>
+        <div class="model-label"><span class="tiny-spark">✦</span> Nusa AI <span class="model-pill">OpenAI</span></div>
+        <button id="mobile-new-chat" class="mobile-new" aria-label="Chat baru">＋</button>
+      </header>
+      <section id="conversation" class="conversation">
+        <div id="welcome" class="welcome">
+          <div class="welcome-orb">✦</div>
+          <p class="eyebrow">ASISTEN AI PRIBADIMU</p>
+          <h1>Apa yang ingin<br><span>kamu ketahui?</span></h1>
+          <p class="welcome-copy">Tanyakan apa saja. Nusa AI siap membantu menjelaskan, menulis, membuat ide, atau coding.</p>
+          <div class="suggestions">
+            <button class="suggestion" data-prompt="Jelaskan fotosintesis dengan bahasa yang mudah dipahami."><span>✎</span><b>Belajar sesuatu</b><small>Jelaskan materi dengan sederhana</small></button>
+            <button class="suggestion" data-prompt="Bantu aku mencari ide proyek kreatif yang menarik."><span>✧</span><b>Cari ide kreatif</b><small>Mulai dari ide yang masih mentah</small></button>
+            <button class="suggestion" data-prompt="Buatkan jadwal belajar 7 hari yang seimbang."><span>▦</span><b>Rencanakan sesuatu</b><small>Susun langkah yang teratur</small></button>
+            <button class="suggestion" data-prompt="Ajari aku dasar HTML dan CSS dengan contoh kode."><span>⌘</span><b>Bantu coding</b><small>Belajar membuat sesuatu</small></button>
+          </div>
+        </div>
+        <div id="messages" class="messages"></div>
+      </section>
+      <div class="composer-wrap">
+        <form id="chat-form" class="composer">
+          <textarea id="message-input" rows="1" maxlength="8000" placeholder="Kirim pesan ke Nusa AI..." aria-label="Tulis pesan"></textarea>
+          <button id="send-button" class="send-button" type="submit" aria-label="Kirim pesan"><span>↑</span></button>
+        </form>
+        <p class="disclaimer">AI bisa membuat kesalahan. Periksa kembali informasi penting.</p>
+      </div>
+    </main>
+  </div>
+
+  <div id="admin-modal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="admin-title">
+    <div class="modal-card admin-card">
+      <div class="modal-head"><div><p class="eyebrow">PENGELOLAAN</p><h2 id="admin-title">Dashboard admin</h2></div><button id="admin-close" class="icon-btn" aria-label="Tutup">✕</button></div>
+      <div id="admin-stats" class="stats"></div>
+      <div class="table-wrap"><table><thead><tr><th>Pengguna</th><th>Role</th><th>Bergabung</th><th>Aksi</th></tr></thead><tbody id="admin-users"></tbody></table></div>
+      <p id="admin-error" class="error hidden"></p>
+    </div>
+  </div>
+</body>
+</html>
