@@ -8,6 +8,9 @@ import dotenv from "dotenv";
 import path from "path";
 import { fileURLToPath } from "url";
 import crypto from "crypto";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import connectPgSimple from "connect-pg-simple";
 
 dotenv.config();
 
@@ -15,9 +18,6 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-
-app.use(express.json({ limit: "1mb" }));
-app.use(express.urlencoded({ extended: true }));
 
 if (!process.env.SESSION_SECRET) {
   throw new Error("SESSION_SECRET belum diatur.");
@@ -31,11 +31,36 @@ const pool = new pg.Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.DATABASE_URL.includes("localhost")
     ? false
-    : { rejectUnauthorized: false }
+    : { rejectUnauthorized: false },
+  max: 10,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000
 });
+
+pool.on("error", (err) => {
+  console.error("Database pool error:", err.message);
+});
+
+const PgSession = connectPgSimple(session);
+
+app.disable("x-powered-by");
+
+if (process.env.NODE_ENV === "production") {
+  app.set("trust proxy", 1);
+}
+
+app.use(helmet());
+app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true }));
 
 app.use(
   session({
+    store: new PgSession({
+      pool,
+      tableName: "session",
+      createTableIfMissing: true
+    }),
+    name: "nusa.sid",
     secret: process.env.SESSION_SECRET,
     resave: false,
     saveUninitialized: false,
@@ -48,9 +73,31 @@ app.use(
   })
 );
 
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { error: "Terlalu banyak percobaan. Coba lagi nanti." }
+});
+
+const chatLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 10,
+  standardHeaders: "draft-7",
+  legacyHeaders: false,
+  message: { error: "Terlalu banyak pesan. Tunggu sebentar." }
+});
+
+app.use("/api/login", authLimiter);
+app.use("/api/register", authLimiter);
+app.use("/api/chat", chatLimiter);
+
 const ai = new OpenAI({
-  apiKey: process.env.OPENROUTER_API_KEY,
-  baseURL: "https://openrouter.ai/api/v1"
+  apiKey: process.env.OPENROUTER_API_KEY || "missing-api-key",
+  baseURL: "https://openrouter.ai/api/v1",
+  timeout: 60000,
+  maxRetries: 1
 });
 
 const MODEL = process.env.OPENROUTER_MODEL || "openrouter/free";
@@ -76,22 +123,50 @@ async function initDatabase() {
     CREATE TABLE IF NOT EXISTS messages (
       id BIGSERIAL PRIMARY KEY,
       chat_id UUID NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
-      role VARCHAR(20) NOT NULL,
+      role VARCHAR(20) NOT NULL
+        CHECK (role IN ('user', 'assistant')),
       content TEXT NOT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW()
     );
+
+    CREATE INDEX IF NOT EXISTS chats_user_updated_idx
+      ON chats(user_id, updated_at DESC);
+
+    CREATE INDEX IF NOT EXISTS messages_chat_id_idx
+      ON messages(chat_id, id);
   `);
+
+  console.log("Database siap.");
 }
 
 function requireLogin(req, res, next) {
   if (!req.session.user) {
-    return res.status(401).json({ error: "Silakan login terlebih dahulu." });
+    return res.status(401).json({
+      error: "Silakan login terlebih dahulu."
+    });
   }
+
   next();
 }
 
 function cleanTitle(text) {
   return text.trim().replace(/\s+/g, " ").slice(0, 60) || "Chat baru";
+}
+
+function validChatId(id) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
+}
+
+function saveSession(req) {
+  return new Promise((resolve, reject) => {
+    req.session.save((err) => (err ? reject(err) : resolve()));
+  });
+}
+
+function destroySession(req) {
+  return new Promise((resolve, reject) => {
+    req.session.destroy((err) => (err ? reject(err) : resolve()));
+  });
 }
 
 app.use(express.static(path.join(__dirname, "public")));
@@ -107,7 +182,7 @@ app.post("/api/register", async (req, res) => {
 
     if (!/^[a-zA-Z0-9_]{3,40}$/.test(username)) {
       return res.status(400).json({
-        error: "Username harus 3–40 karakter, hanya huruf, angka, dan _."
+        error: "Username harus 3–40 karakter, huruf, angka, atau _."
       });
     }
 
@@ -118,6 +193,7 @@ app.post("/api/register", async (req, res) => {
     }
 
     const hash = await bcrypt.hash(password, 12);
+
     const result = await pool.query(
       `INSERT INTO users (username, password_hash)
        VALUES ($1, $2)
@@ -125,12 +201,26 @@ app.post("/api/register", async (req, res) => {
       [username, hash]
     );
 
-    req.session.user = result.rows[0];
-    res.status(201).json({ user: result.rows[0] });
+    req.session.regenerate(async (sessionErr) => {
+      if (sessionErr) {
+        return res.status(500).json({ error: "Gagal membuat sesi." });
+      }
+
+      req.session.user = result.rows[0];
+
+      try {
+        await saveSession(req);
+        res.status(201).json({ user: result.rows[0] });
+      } catch (err) {
+        console.error("Session save error:", err.message);
+        res.status(500).json({ error: "Gagal menyimpan sesi login." });
+      }
+    });
   } catch (err) {
     if (err.code === "23505") {
       return res.status(409).json({ error: "Username sudah digunakan." });
     }
+
     console.error("Register error:", err.message);
     res.status(500).json({ error: "Registrasi gagal." });
   }
@@ -148,18 +238,33 @@ app.post("/api/login", async (req, res) => {
     );
 
     const user = result.rows[0];
+
     if (!user || !(await bcrypt.compare(password, user.password_hash))) {
-      return res.status(401).json({ error: "Username atau password salah." });
+      return res.status(401).json({
+        error: "Username atau password salah."
+      });
     }
 
-    req.session.regenerate((err) => {
+    const safeUser = {
+      id: user.id,
+      username: user.username,
+      is_admin: user.is_admin
+    };
+
+    req.session.regenerate(async (err) => {
       if (err) {
         return res.status(500).json({ error: "Gagal membuat sesi login." });
       }
 
-      const { password_hash, ...safeUser } = user;
       req.session.user = safeUser;
-      res.json({ user: safeUser });
+
+      try {
+        await saveSession(req);
+        res.json({ user: safeUser });
+      } catch (saveErr) {
+        console.error("Session save error:", saveErr.message);
+        res.status(500).json({ error: "Gagal menyimpan sesi login." });
+      }
     });
   } catch (err) {
     console.error("Login error:", err.message);
@@ -167,12 +272,15 @@ app.post("/api/login", async (req, res) => {
   }
 });
 
-app.post("/api/logout", (req, res) => {
-  req.session.destroy((err) => {
-    if (err) return res.status(500).json({ error: "Gagal logout." });
-    res.clearCookie("connect.sid");
+app.post("/api/logout", async (req, res) => {
+  try {
+    await destroySession(req);
+    res.clearCookie("nusa.sid");
     res.json({ ok: true });
-  });
+  } catch (err) {
+    console.error("Logout error:", err.message);
+    res.status(500).json({ error: "Gagal logout." });
+  }
 });
 
 app.get("/api/me", (req, res) => {
@@ -183,10 +291,12 @@ app.get("/api/chats", requireLogin, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, title, created_at, updated_at
-       FROM chats WHERE user_id = $1
+       FROM chats
+       WHERE user_id = $1
        ORDER BY updated_at DESC`,
       [req.session.user.id]
     );
+
     res.json({ chats: result.rows });
   } catch (err) {
     console.error("Chats error:", err.message);
@@ -197,12 +307,14 @@ app.get("/api/chats", requireLogin, async (req, res) => {
 app.post("/api/chats", requireLogin, async (req, res) => {
   try {
     const id = crypto.randomUUID();
+
     const result = await pool.query(
       `INSERT INTO chats (id, user_id, title)
        VALUES ($1, $2, 'Chat baru')
        RETURNING id, title, created_at, updated_at`,
       [id, req.session.user.id]
     );
+
     res.status(201).json({ chat: result.rows[0] });
   } catch (err) {
     console.error("Create chat error:", err.message);
@@ -212,6 +324,10 @@ app.post("/api/chats", requireLogin, async (req, res) => {
 
 app.get("/api/chats/:id/messages", requireLogin, async (req, res) => {
   try {
+    if (!validChatId(req.params.id)) {
+      return res.status(400).json({ error: "ID chat tidak valid." });
+    }
+
     const chat = await pool.query(
       "SELECT id FROM chats WHERE id = $1 AND user_id = $2",
       [req.params.id, req.session.user.id]
@@ -223,9 +339,12 @@ app.get("/api/chats/:id/messages", requireLogin, async (req, res) => {
 
     const result = await pool.query(
       `SELECT id, role, content, created_at
-       FROM messages WHERE chat_id = $1 ORDER BY id ASC`,
+       FROM messages
+       WHERE chat_id = $1
+       ORDER BY id ASC`,
       [req.params.id]
     );
+
     res.json({ messages: result.rows });
   } catch (err) {
     console.error("Messages error:", err.message);
@@ -235,13 +354,19 @@ app.get("/api/chats/:id/messages", requireLogin, async (req, res) => {
 
 app.delete("/api/chats/:id", requireLogin, async (req, res) => {
   try {
+    if (!validChatId(req.params.id)) {
+      return res.status(400).json({ error: "ID chat tidak valid." });
+    }
+
     const result = await pool.query(
       "DELETE FROM chats WHERE id = $1 AND user_id = $2",
       [req.params.id, req.session.user.id]
     );
+
     if (!result.rowCount) {
       return res.status(404).json({ error: "Chat tidak ditemukan." });
     }
+
     res.json({ ok: true });
   } catch (err) {
     console.error("Delete chat error:", err.message);
@@ -250,15 +375,21 @@ app.delete("/api/chats/:id", requireLogin, async (req, res) => {
 });
 
 app.post("/api/chat", requireLogin, async (req, res) => {
-  const text = String(req.body.message || "").trim();
+  const messageText = String(req.body.message || "").trim();
   const chatId = String(req.body.chatId || "");
 
-  if (!text) {
+  if (!messageText) {
     return res.status(400).json({ error: "Pesan tidak boleh kosong." });
   }
 
-  if (text.length > 12000) {
-    return res.status(400).json({ error: "Pesan maksimal 12.000 karakter." });
+  if (messageText.length > 12000) {
+    return res.status(400).json({
+      error: "Pesan maksimal 12.000 karakter."
+    });
+  }
+
+  if (!validChatId(chatId)) {
+    return res.status(400).json({ error: "ID chat tidak valid." });
   }
 
   if (!process.env.OPENROUTER_API_KEY) {
@@ -268,6 +399,7 @@ app.post("/api/chat", requireLogin, async (req, res) => {
   }
 
   const client = await pool.connect();
+  let transactionOpen = false;
 
   try {
     const ownedChat = await client.query(
@@ -280,83 +412,97 @@ app.post("/api/chat", requireLogin, async (req, res) => {
     }
 
     const previous = await client.query(
-      `SELECT role, content FROM messages
-       WHERE chat_id = $1 ORDER BY id DESC LIMIT 20`,
+      `SELECT role, content
+       FROM messages
+       WHERE chat_id = $1
+       ORDER BY id DESC
+       LIMIT 20`,
       [chatId]
     );
 
-    const context = previous.rows.reverse().map((m) => ({
-      role: m.role === "assistant" ? "assistant" : "user",
-      content: m.content
+    const context = previous.rows.reverse().map((item) => ({
+      role: item.role,
+      content: item.content
     }));
 
     await client.query("BEGIN");
+    transactionOpen = true;
+
     await client.query(
-      "INSERT INTO messages (chat_id, role, content) VALUES ($1, 'user', $2)",
-      [chatId, text]
+      `INSERT INTO messages (chat_id, role, content)
+       VALUES ($1, 'user', $2)`,
+      [chatId, messageText]
     );
+
     await client.query(
       `UPDATE chats
-       SET title = CASE WHEN title = 'Chat baru' THEN $2 ELSE title END,
-           updated_at = NOW()
+       SET title = CASE
+           WHEN title = 'Chat baru' THEN $2
+           ELSE title
+         END,
+         updated_at = NOW()
        WHERE id = $1`,
-      [chatId, cleanTitle(text)]
+      [chatId, cleanTitle(messageText)]
     );
+
     await client.query("COMMIT");
+    transactionOpen = false;
 
-    try {
-      const response = await ai.chat.completions.create({
-        model: MODEL,
-        messages: [
-          {
-            role: "system",
-            content:
-              "Kamu adalah Nusa AI, asisten berbahasa Indonesia yang ramah, cerdas, dan jelas. Jawab sesuai bahasa pengguna. Gunakan Markdown jika membantu. Jelaskan langkah demi langkah bila diperlukan. Jangan mengarang fakta dan akui bila tidak yakin."
-          },
-          ...context,
-          { role: "user", content: text }
-        ]
-      });
+    const response = await ai.chat.completions.create({
+      model: MODEL,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Kamu adalah Nusa AI, asisten AI yang ramah, cerdas, dan jelas. Jawab menggunakan bahasa pengguna. Gunakan Markdown bila bermanfaat. Berikan penjelasan langkah demi langkah saat diperlukan. Jangan mengarang fakta dan akui jika tidak yakin."
+        },
+        ...context,
+        { role: "user", content: messageText }
+      ]
+    });
 
-      const answer = String(
-        response.choices?.[0]?.message?.content || ""
-      ).trim() || "Maaf, belum ada jawaban. Coba lagi.";
+    const answer = String(
+      response.choices?.[0]?.message?.content || ""
+    ).trim() || "Maaf, belum ada jawaban. Silakan coba lagi.";
 
-      const saved = await pool.query(
-        `INSERT INTO messages (chat_id, role, content)
-         VALUES ($1, 'assistant', $2)
-         RETURNING id, role, content, created_at`,
-        [chatId, answer]
-      );
+    const saved = await pool.query(
+      `INSERT INTO messages (chat_id, role, content)
+       VALUES ($1, 'assistant', $2)
+       RETURNING id, role, content, created_at`,
+      [chatId, answer]
+    );
 
-      await pool.query(
-        "UPDATE chats SET updated_at = NOW() WHERE id = $1",
-        [chatId]
-      );
+    await pool.query(
+      "UPDATE chats SET updated_at = NOW() WHERE id = $1",
+      [chatId]
+    );
 
-      res.json({ message: saved.rows[0] });
-    } catch (apiError) {
-      console.error(
-        "OpenRouter error:",
-        apiError.status || "",
-        apiError.message
-      );
-      res.status(502).json({
-        error: "AI gagal menjawab. Periksa log server dan batas penggunaan model gratis."
-      });
-    }
+    res.json({ message: saved.rows[0] });
   } catch (err) {
-    await client.query("ROLLBACK").catch(() => {});
-    console.error("Chat error:", err.message);
+    if (transactionOpen) {
+      await client.query("ROLLBACK").catch(() => {});
+    }
+
+    console.error(
+      "Chat error:",
+      err.status || "",
+      err.message
+    );
+
     if (!res.headersSent) {
-      res.status(500).json({ error: "Terjadi kesalahan saat memproses chat." });
+      const status = err.status === 429 ? 429 : 502;
+      res.status(status).json({
+        error:
+          err.status === 429
+            ? "Batas penggunaan AI tercapai. Coba lagi nanti."
+            : "AI gagal menjawab. Periksa konfigurasi OpenRouter atau log server."
+      });
     }
   } finally {
     client.release();
   }
 });
 
-// Admin: daftar pengguna hanya untuk akun yang sudah ditandai is_admin.
 app.get("/api/admin/users", requireLogin, async (req, res) => {
   if (!req.session.user.is_admin) {
     return res.status(403).json({ error: "Akses admin ditolak." });
@@ -365,8 +511,10 @@ app.get("/api/admin/users", requireLogin, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, username, is_admin, created_at
-       FROM users ORDER BY created_at DESC`
+       FROM users
+       ORDER BY created_at DESC`
     );
+
     res.json({ users: result.rows });
   } catch (err) {
     console.error("Admin error:", err.message);
@@ -378,9 +526,21 @@ app.get("*", (req, res, next) => {
   if (req.path.startsWith("/api/")) {
     return res.status(404).json({ error: "Endpoint tidak ditemukan." });
   }
-  res.sendFile(path.join(__dirname, "public", "index.html"), (err) => {
-    if (err) next(err);
-  });
+
+  res.sendFile(
+    path.join(__dirname, "public", "index.html"),
+    (err) => {
+      if (err) next(err);
+    }
+  );
+});
+
+app.use((err, req, res, next) => {
+  console.error("Server error:", err.message);
+
+  if (res.headersSent) return next(err);
+
+  res.status(500).json({ error: "Terjadi kesalahan pada server." });
 });
 
 initDatabase()
